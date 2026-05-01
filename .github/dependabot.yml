@@ -1,0 +1,31 @@
+version: 2
+
+updates:
+  # Keep GitHub Actions action versions up to date.
+  # This prevents supply-chain attacks from pinned-but-stale action versions
+  # and ensures compatibility with the latest runner Node.js runtimes.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  # Keep Flutter/Dart pub.dev dependencies up to date.
+  # Dependabot will open PRs to bump versions in pubspec.yaml whenever
+  # newer compatible releases are available.
+  - package-ecosystem: "pub"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "flutter"
+    # Group all Flutter/Dart pub.dev updates into a single PR to reduce review noise
+    groups:
+      flutter-dependencies:
+        patterns:
+          - "*"
