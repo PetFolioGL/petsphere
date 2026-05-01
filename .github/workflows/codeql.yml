@@ -1,9 +1,13 @@
 name: "CodeQL Advanced"
 
-# Scans GitHub Actions workflow files (actions) and native iOS Swift code (swift).
-# Note: Dart/Flutter source is not yet supported by CodeQL. The java-kotlin matrix
-# entry has been removed because Flutter's Android Kotlin is auto-generated
-# boilerplate that CodeQL autobuild cannot compile without a full Flutter setup.
+# Scans three code surfaces:
+#   actions      – GitHub Actions workflow YAML (supply-chain vulnerabilities)
+#   java-kotlin  – Android Kotlin source compiled via Gradle + Flutter Gradle plugin
+#   swift        – native iOS Swift source compiled via Flutter build ios
+#
+# Both compiled-language jobs use build-mode: manual so that the full Flutter
+# toolchain is available before CodeQL's tracer intercepts the JVM / Swift
+# compiler invocations.
 
 on:
   push:
@@ -28,32 +32,123 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Scan GitHub Actions workflow YAML files for supply-chain vulnerabilities
+          # ── GitHub Actions YAML ─────────────────────────────────────────────
           - language: actions
             build-mode: none
-          # Scan native iOS Swift code; requires a full Flutter build so CodeQL
-          # can trace the Swift compilation (manual build mode)
+            needs-flutter: false
+
+          # ── Android / Kotlin ────────────────────────────────────────────────
+          # Flutter's Android project uses:
+          #   • AGP 8.9.1  (requires JDK 17+)
+          #   • Gradle 8.14 (via gradle-wrapper.properties)
+          #   • Kotlin Android plugin 2.1.0
+          #   • dev.flutter.flutter-gradle-plugin (reads flutter.sdk from
+          #     android/local.properties – must be created before Gradle runs)
+          - language: java-kotlin
+            build-mode: manual
+            needs-flutter: true
+
+          # ── iOS / Swift ─────────────────────────────────────────────────────
           - language: swift
             build-mode: manual
+            needs-flutter: true
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Flutter must be available before CodeQL init so that `flutter pub get`
-      # can resolve dependencies; the actual iOS compile happens after init so
-      # CodeQL's build tracer can observe the Swift compilation.
+      # ── Java 17 setup (Android / Kotlin job only) ──────────────────────────
+      # AGP 8.9.1 requires JDK 17+.  The temurin distribution matches what
+      # Android Studio bundles and is the same family used in the project's
+      # gradle.properties "jbr" reference.
+      - name: Setup Java 17
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ── Gradle dependency cache (Android / Kotlin job only) ────────────────
+      # Caches ~/.gradle/caches and ~/.gradle/wrapper to avoid re-downloading
+      # Gradle 8.14 and all plugin/dependency JARs on every run.
+      - name: Cache Gradle dependencies
+        if: matrix.language == 'java-kotlin'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Only the three root-level build scripts and the wrapper properties
+          # determine which Gradle version and plugin JARs are downloaded.
+          # A glob pattern (android/**/*.gradle.kts) was intentionally avoided
+          # because it would invalidate the cache on comment-only edits in nested
+          # modules.  If new Gradle modules are added, include their build files here.
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/build.gradle.kts', 'android/settings.gradle.kts', 'android/app/build.gradle.kts') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      # ── Flutter setup (Android and iOS jobs) ───────────────────────────────
+      # Flutter must be installed BEFORE CodeQL init so that:
+      #   (a) flutter pub get can run, and
+      #   (b) the Flutter Gradle plugin JAR is on disk when Gradle initialises.
       - name: Setup Flutter
-        if: matrix.language == 'swift'
+        if: matrix.needs-flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
       - name: Flutter pub get
-        if: matrix.language == 'swift'
+        if: matrix.needs-flutter
         run: flutter pub get
 
+      # ── Android-specific pre-build configuration ───────────────────────────
+      # 1. android/local.properties – required by settings.gradle.kts to locate
+      #    the Flutter SDK (flutter.sdk) and the Android SDK (sdk.dir).
+      #    Flutter writes this file automatically for local development but CI
+      #    runners start with a clean checkout.
+      # 2. android/gradle.properties – the committed file contains two CI-
+      #    incompatible settings that must be patched before Gradle runs:
+      #      • org.gradle.java.home – points to a Windows path; remove it so
+      #        Gradle uses the JDK selected by actions/setup-java above.
+      #      • org.gradle.jvmargs Xmx8G – exceeds the 7 GB available on
+      #        ubuntu-latest; reduce to 4 GB.
+      - name: Configure Android local.properties
+        if: matrix.language == 'java-kotlin'
+        run: |
+          # flutter --version --machine outputs stable JSON that includes the
+          # Flutter SDK root path, which is more reliable than walking dirname
+          # chains from the flutter binary location.
+          FLUTTER_ROOT_PATH=$(flutter --version --machine 2>/dev/null \
+            | python3 -c "import sys, json; print(json.load(sys.stdin)['flutterRoot'])")
+          if [ -z "${FLUTTER_ROOT_PATH}" ]; then
+            echo "ERROR: Could not determine Flutter SDK path from 'flutter --version --machine'" >&2
+            exit 1
+          fi
+          if [ -z "${ANDROID_HOME}" ]; then
+            echo "ERROR: ANDROID_HOME is not set" >&2
+            exit 1
+          fi
+          {
+            echo "flutter.sdk=${FLUTTER_ROOT_PATH}"
+            echo "sdk.dir=${ANDROID_HOME}"
+          } > android/local.properties
+
+      - name: Patch android/gradle.properties for CI
+        if: matrix.language == 'java-kotlin'
+        working-directory: android
+        run: |
+          # Remove the Windows-specific JDK override (incompatible with Linux)
+          sed -i '/^org\.gradle\.java\.home/d' gradle.properties
+          # Lower JVM heap to leave headroom for the OS and other processes:
+          #   3 GB heap + 1 GB metaspace + 256 MB code cache ≈ 4.25 GB total
+          #   leaving ~2.75 GB for the runner OS on ubuntu-latest (7 GB RAM)
+          CI_JVM_ARGS="-Xmx3G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=256m -XX:+HeapDumpOnOutOfMemoryError"
+          sed -i "s/^org\.gradle\.jvmargs=.*/org.gradle.jvmargs=${CI_JVM_ARGS}/" gradle.properties
+
+      # ── CodeQL initialisation ──────────────────────────────────────────────
+      # Must run AFTER Flutter/Java are installed but BEFORE the build so the
+      # tracer is in place when the compiler is invoked.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
@@ -63,8 +158,22 @@ jobs:
           # of the default security suite (recommended for production apps)
           queries: security-extended
 
-      # Build iOS so CodeQL's tracer can capture Swift compilation artifacts.
-      # --no-codesign avoids certificate requirements on CI runners.
+      # ── Android build (inside CodeQL tracing window) ───────────────────────
+      # flutter build apk:
+      #   1. Writes android/local.properties (flutter.sdk, sdk.dir) – already
+      #      done above, but Flutter may overwrite; that is fine.
+      #   2. Invokes ./gradlew assembleDebug, which compiles MainActivity.kt
+      #      and all plugin Kotlin sources.  CodeQL's JVM agent intercepts every
+      #      javac / kotlinc invocation during this step.
+      # --debug avoids release signing requirements on CI.
+      - name: Build Android APK for CodeQL tracing
+        if: matrix.language == 'java-kotlin'
+        run: flutter build apk --debug
+
+      # ── iOS build (inside CodeQL tracing window) ───────────────────────────
+      # --no-codesign skips certificate requirements.
+      # --simulator targets the simulator SDK (x86_64/arm64) which does not
+      # require a provisioning profile and is faster to compile.
       - name: Build iOS for CodeQL tracing
         if: matrix.language == 'swift'
         run: flutter build ios --no-codesign --simulator
