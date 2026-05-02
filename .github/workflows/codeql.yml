@@ -20,6 +20,12 @@ on:
     # Run every Monday at 08:16 UTC to catch newly disclosed vulnerabilities
     - cron: '16 8 * * 1'
 
+# Cancel in-progress CodeQL scans on the same PR when a new commit is pushed.
+# Scheduled runs are never cancelled (cancel-in-progress is false for them).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})

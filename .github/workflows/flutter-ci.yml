@@ -1,0 +1,244 @@
+name: Flutter CI
+
+# Runs on every push to main and on every pull request targeting main.
+# Three parallel jobs after a shared lint+test gate:
+#   lint-and-test  – static analysis + unit/widget tests (ubuntu-latest, fast)
+#   build-android  – debug APK compilation             (ubuntu-latest)
+#   build-ios      – unsigned simulator IPA            (macos-latest)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# Minimal GITHUB_TOKEN permissions for all jobs in this workflow.
+# Individual jobs that need additional permissions override this below.
+permissions:
+  contents: read
+
+# JVM flags shared by the Android build job and (if added) the CodeQL Android
+# job.  Keep them here so tuning heap sizes only requires one edit.
+env:
+  CI_GRADLE_JVM_ARGS: >-
+    -Xmx3G
+    -XX:MaxMetaspaceSize=1G
+    -XX:ReservedCodeCacheSize=256m
+    -XX:+HeapDumpOnOutOfMemoryError
+
+# Cancel any in-progress run for the same branch / PR when a new commit is
+# pushed.  This keeps CI green without wasting runner minutes on stale runs.
+# Schedule and manual triggers are never cancelled (they always run to completion).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1 – Lint & Test
+  # Fast gate that must pass before platform builds are attempted.
+  # Runs on ubuntu-latest (cheapest, no need for macOS here).
+  # ─────────────────────────────────────────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # subosito/flutter-action manages the Flutter SDK and caches it between
+      # runs.  `cache: true` stores the SDK archive so the download only happens
+      # once per Flutter version.
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Cache the Pub package download cache.  The cache key changes only when
+      # pubspec.lock changes, so Pub dependencies are re-downloaded at most once
+      # per dependency update.
+      - name: Cache Pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # dart format returns a non-zero exit code if any file would be changed,
+      # enforcing a consistent style across the codebase.
+      # Run `dart format lib/ test/` locally to fix any formatting issues.
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed lib/ test/
+
+      # flutter analyze runs the Dart static analyser over the entire project.
+      # --no-fatal-infos: info-level hints do not fail the job (warnings and
+      # errors still do).  Tighten to --fatal-infos once the backlog is clear.
+      - name: Analyze code
+        run: flutter analyze --no-fatal-infos
+
+      # Run all unit and widget tests.  Use --reporter=github for richer output
+      # directly in the GitHub Actions log.
+      - name: Run tests
+        run: flutter test --reporter=github
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2 – Android debug APK
+  # Verifies the Android build pipeline on every push/PR.
+  # Only starts after lint-and-test passes.
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: lint-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # AGP 8.9.1 requires JDK 17+.  The temurin distribution matches what
+      # Android Studio bundles.
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Cache both the downloaded Gradle distributions and the build-script
+      # dependency JARs.  The key includes all root-level Gradle files that
+      # control which versions are fetched.
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/build.gradle.kts', 'android/settings.gradle.kts', 'android/app/build.gradle.kts') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Cache Pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # The committed gradle.properties contains two CI-incompatible settings:
+      #   • org.gradle.java.home – Windows path, incompatible on Linux runners.
+      #   • org.gradle.jvmargs Xmx8G – exceeds the 7 GB on ubuntu-latest.
+      # Patch both in-place before Gradle is invoked.
+      - name: Patch android/gradle.properties for CI
+        working-directory: android
+        run: |
+          sed -i '/^org\.gradle\.java\.home/d' gradle.properties
+          sed -i "s/^org\.gradle\.jvmargs=.*/org.gradle.jvmargs=$CI_GRADLE_JVM_ARGS/" gradle.properties
+
+      # flutter build apk writes android/local.properties (flutter.sdk, sdk.dir)
+      # automatically when it detects they are missing, so no manual step is
+      # needed here (unlike the CodeQL job which must init before the build).
+      - name: Build Android APK (debug)
+        run: flutter build apk --debug
+
+      # Upload the APK so it can be downloaded from the Actions summary for
+      # manual smoke-testing.  Kept for 7 days to balance storage cost vs.
+      # usefulness for short-lived feature branches.
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk-${{ github.run_number }}
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 7
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 3 – iOS simulator build (unsigned)
+  # Verifies the iOS build pipeline without requiring signing credentials.
+  # Must run on macos-latest (Xcode is macOS-only).
+  # Only starts after lint-and-test passes.
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-ios:
+    name: Build iOS (simulator, no-codesign)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    needs: lint-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Cache the CocoaPods master spec repo.  This repo is ~500 MB and takes
+      # several minutes to clone from scratch; caching it speeds up the first
+      # `pod install` significantly.  The pubspec.lock is used as the cache key
+      # because Flutter plugin updates are the main source of Podfile changes.
+      - name: Cache CocoaPods repos
+        uses: actions/cache@v4
+        with:
+          path: ~/.cocoapods/repos
+          key: cocoapods-repos-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            cocoapods-repos-${{ runner.os }}-
+
+      # Cache the resolved Pods directory.  When both the spec repo and the
+      # Pods directory are cached, `flutter build ios` skips pod install
+      # entirely, saving 2-5 minutes per run.
+      - name: Cache Pods
+        uses: actions/cache@v4
+        with:
+          path: ios/Pods
+          key: pods-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pods-${{ runner.os }}-
+
+      - name: Cache Pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # --no-codesign: skips all signing requirements (no certificate needed).
+      # --simulator:   targets the simulator SDK (arm64 on Apple Silicon runners,
+      #                x86_64 on older Intel runners).  No provisioning profile
+      #                is required and compilation is faster than the device SDK.
+      # flutter build ios invokes `pod install` automatically if ios/Pods is
+      # absent or stale, so no explicit pod install step is required.
+      - name: Build iOS app (simulator, unsigned)
+        run: flutter build ios --no-codesign --simulator
+
+      # Upload the compiled .app bundle as a zipped artifact for inspection.
+      # The artifact can be run in the iOS Simulator on any Mac without signing.
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-app-${{ github.run_number }}
+          path: build/ios/iphonesimulator/Runner.app
+          retention-days: 7
+          if-no-files-found: warn
