@@ -1,13 +1,15 @@
 name: "CodeQL Advanced"
 
-# Scans three code surfaces:
+# Scans two code surfaces:
 #   actions      – GitHub Actions workflow YAML (supply-chain vulnerabilities)
 #   java-kotlin  – Android Kotlin source compiled via Gradle + Flutter Gradle plugin
-#   swift        – native iOS Swift source compiled via Flutter build ios
 #
-# Both compiled-language jobs use build-mode: manual so that the full Flutter
-# toolchain is available before CodeQL's tracer intercepts the JVM / Swift
-# compiler invocations.
+# Swift was removed from the matrix because this Flutter project contains no
+# native Swift sources.  CodeQL's Swift extractor requires at least one Swift
+# compilation to occur during tracing; without it the job exits with code 32
+# ("CodeQL detected code written in Swift but this run didn't build any of it").
+# If native Swift sources are added in the future, restore the swift matrix entry
+# and the accompanying "Build iOS for CodeQL tracing" step.
 
 on:
   push:
@@ -18,10 +20,16 @@ on:
     # Run every Monday at 08:16 UTC to catch newly disclosed vulnerabilities
     - cron: '16 8 * * 1'
 
+# Cancel in-progress CodeQL scans on the same PR when a new commit is pushed.
+# Scheduled runs are never cancelled (cancel-in-progress is false for them).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       security-events: write
       packages: read
@@ -49,9 +57,8 @@ jobs:
             needs-flutter: true
 
           # ── iOS / Swift ─────────────────────────────────────────────────────
-          - language: swift
-            build-mode: manual
-            needs-flutter: true
+          # Removed: this Flutter project contains no native Swift sources.
+          # See header comment for details.
 
     steps:
       - name: Checkout repository
@@ -170,13 +177,9 @@ jobs:
         if: matrix.language == 'java-kotlin'
         run: flutter build apk --debug
 
-      # ── iOS build (inside CodeQL tracing window) ───────────────────────────
-      # --no-codesign skips certificate requirements.
-      # --simulator targets the simulator SDK (x86_64/arm64) which does not
-      # require a provisioning profile and is faster to compile.
-      - name: Build iOS for CodeQL tracing
-        if: matrix.language == 'swift'
-        run: flutter build ios --no-codesign --simulator
+      # ── iOS build step removed ────────────────────────────────────────────
+      # The "Build iOS for CodeQL tracing" step (flutter build ios --no-codesign
+      # --simulator) was removed together with the swift matrix entry above.
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
