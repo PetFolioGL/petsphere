@@ -55,7 +55,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # ── Java 17 setup (Android / Kotlin job only) ──────────────────────────
       # AGP 8.9.1 requires JDK 17+.  The temurin distribution matches what
